@@ -7,10 +7,13 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import WordChip from '../components/WordChip';
 import {
-  generateSentence, scrambleSentence, checkArrangement,
-  getAIHint, calculateScore
+  generateAdaptiveSentence, scrambleSentence, checkArrangement,
+  getAIHint, calculateScore, analyzeMistake
 } from '../services/aiService';
-import { getApiKey, updateStats } from '../services/storageService';
+import {
+  getApiKey, updateStats, saveMistakeRecord,
+  updateWeaknessFromAnalysis, getWeaknessProfile
+} from '../services/storageService';
 
 const DIFFICULTY_CONFIG = {
   beginner: { color: '#34C759', label: 'Beginner', emoji: '🌱' },
@@ -35,13 +38,17 @@ export default function GameScreen({ route, navigation }) {
   const [score, setScore] = useState(0);
   const [showConfetti, setShowConfetti] = useState(false);
   const [apiKey, setApiKey] = useState('');
+  const [mistakeAnalysis, setMistakeAnalysis] = useState(null);
+  const [weaknessInsight, setWeaknessInsight] = useState(null);
+  const [currentSentence, setCurrentSentence] = useState('');
 
   const shakeAnim = useRef(new Animated.Value(0)).current;
   const bounceAnim = useRef(new Animated.Value(0)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const confettiAnim = useRef(new Animated.Value(0)).current;
+  const insightAnim = useRef(new Animated.Value(0)).current;
 
-  const loadSentence = useCallback(async () => {
+  const loadSentence = useCallback(async (focusWeakness = false) => {
     setLoading(true);
     setShowResult(false);
     setIsCorrect(null);
@@ -51,15 +58,26 @@ export default function GameScreen({ route, navigation }) {
     setScore(0);
     setShowConfetti(false);
     setPlacedWords([]);
-    
+    setMistakeAnalysis(null);
+    setWeaknessInsight(null);
+
     const key = await getApiKey();
     setApiKey(key);
-    
-    const sentence = await generateSentence(difficulty, key);
+
+    let sentence;
+    if (focusWeakness && key) {
+      // Generate adaptive sentence targeting weak areas
+      const profile = await getWeaknessProfile();
+      sentence = await generateAdaptiveSentence(difficulty, key, profile);
+    } else {
+      sentence = await generateAdaptiveSentence(difficulty, key, { categories: {} });
+    }
+
     const scrambled = scrambleSentence(sentence);
     setSentenceData(scrambled);
     setAvailableWords(scrambled.words);
-    
+    setCurrentSentence(sentence);
+
     setLoading(false);
     Animated.timing(fadeAnim, {
       toValue: 1,
@@ -74,20 +92,22 @@ export default function GameScreen({ route, navigation }) {
 
   const handleWordPress = (word, index) => {
     if (showResult) return;
-    
+
     setPlacedWords(prev => [...prev, word]);
     setAvailableWords(prev => prev.filter((_, i) => i !== index));
     setIsCorrect(null);
     setHint(null);
+    setMistakeAnalysis(null);
   };
 
   const handlePlacedWordPress = (word, index) => {
     if (showResult) return;
-    
+
     setPlacedWords(prev => prev.filter((_, i) => i !== index));
     setAvailableWords(prev => [...prev, word]);
     setIsCorrect(null);
     setHint(null);
+    setMistakeAnalysis(null);
   };
 
   const handleCheck = async () => {
@@ -101,25 +121,25 @@ export default function GameScreen({ route, navigation }) {
     const newAttempts = attempts + 1;
     setAttempts(newAttempts);
     setIsCorrect(correct);
-    
+
     if (correct) {
       const finalScore = calculateScore(sentenceData.originalWords, newAttempts, usedHint);
       setScore(finalScore);
-      
+
       Animated.spring(bounceAnim, {
         toValue: 1,
         friction: 3,
         tension: 40,
         useNativeDriver: true,
       }).start();
-      
+
       setShowConfetti(true);
       Animated.timing(confettiAnim, {
         toValue: 1,
         duration: 1000,
         useNativeDriver: true,
       }).start();
-      
+
       await updateStats({
         correct: true,
         score: finalScore,
@@ -127,6 +147,7 @@ export default function GameScreen({ route, navigation }) {
         difficulty: difficulty,
       });
     } else {
+      // Shake animation
       Animated.sequence([
         Animated.timing(shakeAnim, { toValue: 10, duration: 50, useNativeDriver: true }),
         Animated.timing(shakeAnim, { toValue: -10, duration: 50, useNativeDriver: true }),
@@ -134,9 +155,37 @@ export default function GameScreen({ route, navigation }) {
         Animated.timing(shakeAnim, { toValue: -8, duration: 50, useNativeDriver: true }),
         Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
       ]).start();
-      
-      // AI hint
-      if (apiKey) {
+
+      // Save mistake for weakness analysis
+      const mistakeData = {
+        sentence: sentenceData.original,
+        userArrangement: placedWords,
+        correctArrangement: sentenceData.originalWords,
+        difficulty: difficulty,
+      };
+      await saveMistakeRecord(mistakeData);
+
+      // Run AI analysis on the mistake
+      const analysis = await analyzeMistake(
+        sentenceData.original,
+        placedWords,
+        apiKey
+      );
+      if (analysis) {
+        setMistakeAnalysis(analysis);
+        // Update the weakness profile
+        await updateWeaknessFromAnalysis(analysis);
+
+        // Show insight panel with animation
+        Animated.timing(insightAnim, {
+          toValue: 1,
+          duration: 400,
+          useNativeDriver: true,
+        }).start();
+      }
+
+      // AI hint (separate from analysis)
+      if (apiKey && !hint) {
         const aiHint = await getAIHint(
           sentenceData.original,
           placedWords,
@@ -147,7 +196,7 @@ export default function GameScreen({ route, navigation }) {
           setUsedHint(true);
         }
       }
-      
+
       await updateStats({
         correct: false,
         score: 0,
@@ -155,49 +204,52 @@ export default function GameScreen({ route, navigation }) {
         difficulty: difficulty,
       });
     }
-    
+
     setChecking(false);
     setShowResult(true);
   };
 
-  const handleNext = () => {
-    fadeAnim.setValue(0);
-    bounceAnim.setValue(0);
-    confettiAnim.setValue(0);
-    loadSentence();
+  const handleNextQuestion = async () => {
+    // Use adaptive generation if we have weakness data
+    const profile = await getWeaknessProfile();
+    const hasWeaknessData = Object.values(profile.categories || {}).some(c => c.total >= 2);
+    await loadSentence(hasWeaknessData);
+    insightAnim.setValue(0);
   };
 
   const handleReveal = () => {
     Alert.alert(
-      'Reveal Answer',
-      `The correct sentence is:\n\n"${sentenceData.original}"\n\nWant to try a new one?`,
-      [
-        { text: 'Try Again', style: 'cancel' },
-        { text: 'New Sentence', onPress: handleNext },
-      ]
+      'Correct Answer',
+      sentenceData.original,
+      [{ text: 'OK' }]
     );
   };
 
   const renderConfetti = () => {
     if (!showConfetti) return null;
-    const particles = ['✨', '⭐', '🌟', '💫', '🎉', '🎊'];
+    const particles = ['🎉', '⭐', '✨', '🎊', '💫', '🌟'];
     return (
-      <View style={styles.confettiContainer}>
+      <View style={styles.confettiContainer} pointerEvents="none">
         {particles.map((p, i) => (
           <Animated.Text
             key={i}
             style={[
               styles.confettiParticle,
               {
-                left: 10 + (i * 60) % (Dimensions.get('window').width - 20),
+                left: (width / particles.length) * i + 10,
                 opacity: confettiAnim.interpolate({
-                  inputRange: [0, 0.5, 1],
-                  outputRange: [0, 1, 0],
+                  inputRange: [0, 0.3, 1],
+                  outputRange: [1, 0.8, 0],
                 }),
                 transform: [{
                   translateY: confettiAnim.interpolate({
                     inputRange: [0, 1],
-                    outputRange: [0, -200 - i * 30],
+                    outputRange: [0, 250 + i * 30],
+                  }),
+                }, {
+                  rotate: confettiAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: ['0deg', `${360 + i * 90}deg`],
                   }),
                 }],
               },
@@ -210,112 +262,174 @@ export default function GameScreen({ route, navigation }) {
     );
   };
 
-  if (loading) {
-    return (
-      <SafeAreaView style={[styles.container, { backgroundColor: '#F8F9FA' }]}>
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color={config.color} />
-          <Text style={styles.loadingText}>Generating sentence...</Text>
-          <Text style={styles.loadingSubtext}>Using {apiKey ? 'AI' : 'built-in'} sentences</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: '#F8F9FA' }]}>
       <StatusBar style="dark" />
-      
+
       <View style={styles.topBar}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
           <Text style={styles.backBtnText}>← Back</Text>
         </TouchableOpacity>
         <View style={styles.topBarCenter}>
-          <Text style={styles.diffLabel}>{config.emoji} {config.label}</Text>
+          <Text style={[styles.diffLabel, { color: config.color }]}>
+            {config.emoji} {config.label}
+          </Text>
         </View>
         <View style={styles.scoreBadge}>
           <Text style={styles.scoreText}>⭐ {score}</Text>
         </View>
       </View>
 
-      {renderConfetti()}
-
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        <Animated.View style={{ opacity: fadeAnim }}>
-          <View style={styles.instructionCard}>
+      {loading ? (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={config.color} />
+          <Text style={styles.loadingText}>🧠 Preparing your exercise...</Text>
+          <Text style={styles.loadingSubtext}>
+            {apiKey ? 'Generating with AI' : 'Loading sentence'}
+          </Text>
+        </View>
+      ) : (
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+        >
+          <Animated.View
+            style={[
+              styles.instructionCard,
+              {
+                opacity: fadeAnim,
+                backgroundColor: config.color + '15',
+              },
+            ]}
+          >
             <Text style={styles.instructionText}>
-              📝 Arrange the words to form a correct English sentence
+              Tap words to arrange them in the correct order!
             </Text>
-          </View>
+          </Animated.View>
 
-          {/* Placed words area */}
-          <View style={styles.placedArea}>
-            <Text style={styles.areaLabel}>Your Answer:</Text>
+          <Animated.View style={[styles.placedArea, { opacity: fadeAnim }]}>
+            <Text style={styles.areaLabel}>📝 Your Answer</Text>
             <Animated.View
               style={[
                 styles.wordsContainer,
-                { transform: [{ translateX: shakeAnim }] },
                 isCorrect === true && styles.correctBorder,
                 isCorrect === false && styles.wrongBorder,
+                isCorrect === false && { transform: [{ translateX: shakeAnim }] },
+                isCorrect === true && {
+                  transform: [{
+                    scale: bounceAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [1, 1.05],
+                    }),
+                  }],
+                },
               ]}
             >
-              {placedWords.length === 0 ? (
-                <Text style={styles.placeholderText}>Tap words below to arrange them...</Text>
-              ) : (
-                <View style={styles.wordsRow}>
-                  {placedWords.map((word, index) => (
+              <View style={styles.wordsRow}>
+                {placedWords.length === 0 ? (
+                  <Text style={styles.placeholderText}>Tap words below to start...</Text>
+                ) : (
+                  placedWords.map((word, index) => (
                     <WordChip
-                      key={`placed-${index}-${word}`}
+                      key={`placed-${word}-${index}`}
                       word={word}
+                      selected
+                      color={config.color}
+                      size="small"
                       onPress={() => handlePlacedWordPress(word, index)}
-                      color={config.color}
-                      selected={true}
                     />
-                  ))}
-                </View>
-              )}
+                  ))
+                )}
+              </View>
             </Animated.View>
-          </View>
+          </Animated.View>
 
-          {/* Available words area */}
-          <View style={styles.availableArea}>
-            <Text style={styles.areaLabel}>Available Words:</Text>
-            <Animated.View style={[styles.wordsContainer]}>
-              {availableWords.length === 0 ? (
-                <Text style={styles.placeholderText}>✓ All words placed!</Text>
-              ) : (
-                <View style={styles.wordsRow}>
-                  {availableWords.map((word, index) => (
+          <Animated.View style={[styles.availableArea, { opacity: fadeAnim }]}>
+            <Text style={styles.areaLabel}>📦 Available Words ({availableWords.length})</Text>
+            <View style={[styles.wordsContainer, { borderStyle: 'dashed' }]}>
+              <View style={styles.wordsRow}>
+                {availableWords.length === 0 ? (
+                  <Text style={styles.placeholderText}>All words placed!</Text>
+                ) : (
+                  availableWords.map((word, index) => (
                     <WordChip
-                      key={`avail-${index}-${word}`}
+                      key={`avail-${word}-${index}`}
                       word={word}
-                      onPress={() => handleWordPress(word, index)}
                       color={config.color}
-                      selected={false}
+                      onPress={() => handleWordPress(word, index)}
                     />
+                  ))
+                )}
+              </View>
+            </View>
+          </Animated.View>
+
+          {/* Weakness Analysis Insight (shown after wrong answer) */}
+          {mistakeAnalysis && (
+            <Animated.View
+              style={[
+                styles.insightCard,
+                {
+                  opacity: insightAnim,
+                  transform: [{
+                    translateY: insightAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [20, 0],
+                    }),
+                  }],
+                },
+              ]}
+            >
+              <Text style={styles.insightTitle}>💡 Learning Insight</Text>
+              {mistakeAnalysis.explanation && (
+                <Text style={styles.insightText}>{mistakeAnalysis.explanation}</Text>
+              )}
+              {mistakeAnalysis.categories && mistakeAnalysis.categories.length > 0 && (
+                <View style={styles.insightTags}>
+                  {mistakeAnalysis.categories.slice(0, 3).map(cat => (
+                    <View key={cat} style={[styles.insightTag, { backgroundColor: '#FFE0B2' }]}>
+                      <Text style={styles.insightTagText}>
+                        {cat === 'wordOrder' ? '📋 Word Order' :
+                         cat === 'subjectVerbAgreement' ? '🔗 Subject-Verb' :
+                         cat === 'articleUsage' ? '📌 Article' :
+                         cat === 'prepositionUsage' ? '📍 Preposition' :
+                         cat === 'tenseUsage' ? '⏰ Tense' :
+                         cat === 'conjunctionUsage' ? '🔀 Conjunction' :
+                         cat === 'adverbPlacement' ? '⚡ Adverb' :
+                         cat === 'adjectiveOrder' ? '🎨 Adjective' :
+                         cat === 'negation' ? '🚫 Negation' :
+                         cat === 'pronounUsage' ? '👤 Pronoun' : cat}
+                      </Text>
+                    </View>
                   ))}
                 </View>
               )}
+              {mistakeAnalysis.problemWords && mistakeAnalysis.problemWords.length > 0 && (
+                <Text style={styles.insightWords}>
+                  Pay attention to: {mistakeAnalysis.problemWords.slice(0, 3).map(w => `"${w}"`).join(', ')}
+                </Text>
+              )}
             </Animated.View>
-          </View>
+          )}
 
-          {/* Hint area */}
-          {hint && (
-            <View style={styles.hintCard}>
-              <Text style={styles.hintText}>💡 {hint}</Text>
-            </View>
+          {/* AI Hint */}
+          {hint && !mistakeAnalysis && (
+            <Animated.View style={[styles.hintCard, { opacity: insightAnim }]}>
+              <Text style={styles.hintLabel}>💡 Hint</Text>
+              <Text style={styles.hintText}>{hint}</Text>
+            </Animated.View>
           )}
 
           {/* Buttons */}
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[styles.btn, styles.revealBtn]}
-              onPress={handleReveal}
-            >
-              <Text style={styles.revealBtnText}>👀 Reveal</Text>
-            </TouchableOpacity>
-
-            {!showResult ? (
+          {!showResult ? (
+            <Animated.View style={[styles.buttonRow, { opacity: fadeAnim }]}>
+              <TouchableOpacity
+                style={[styles.btn, styles.revealBtn]}
+                onPress={handleReveal}
+              >
+                <Text style={styles.revealBtnText}>👁️ Reveal</Text>
+              </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.btn, styles.checkBtn, { backgroundColor: config.color }]}
                 onPress={handleCheck}
@@ -327,46 +441,62 @@ export default function GameScreen({ route, navigation }) {
                   <Text style={styles.checkBtnText}>✓ Check</Text>
                 )}
               </TouchableOpacity>
-            ) : (
-              <TouchableOpacity
-                style={[styles.btn, styles.nextBtn, { backgroundColor: config.color }]}
-                onPress={handleNext}
-              >
-                <Text style={styles.nextBtnText}>Next →</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          {/* Result message */}
-          {isCorrect === true && (
-            <Animated.View
-              style={[
-                styles.resultCard,
-                styles.successCard,
-                { transform: [{ scale: bounceAnim.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [0.8, 1],
-                })}] }
-              ]}
-            >
-              <Text style={styles.resultEmoji}>🎉</Text>
-              <Text style={styles.resultTitle}>Perfect!</Text>
-              <Text style={styles.resultScore}>+{score} points</Text>
-              {attempts > 1 && (
-                <Text style={styles.resultDetail}>Solved in {attempts} attempt{attempts > 1 ? 's' : ''}!</Text>
+            </Animated.View>
+          ) : (
+            <Animated.View style={[styles.buttonRow, { opacity: fadeAnim }]}>
+              {isCorrect === false && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.revealBtn]}
+                  onPress={handleReveal}
+                >
+                  <Text style={styles.revealBtnText}>👁️ Reveal</Text>
+                </TouchableOpacity>
               )}
+              <TouchableOpacity
+                style={[styles.btn, isCorrect ? styles.checkBtn : styles.nextBtn, { backgroundColor: config.color }]}
+                onPress={handleNextQuestion}
+              >
+                <Text style={styles.nextBtnText}>
+                  {isCorrect ? '➡️ Next Question' : '🔄 Try Another'}
+                </Text>
+              </TouchableOpacity>
             </Animated.View>
           )}
 
-          {isCorrect === false && (
-            <View style={[styles.resultCard, styles.errorCard]}>
-              <Text style={styles.resultEmoji}>🤔</Text>
-              <Text style={styles.resultTitle}>Not quite right</Text>
-              <Text style={styles.resultDetail}>Try rearranging the words!</Text>
-            </View>
-          )}
-        </Animated.View>
-      </ScrollView>
+          {/* Result Cards */}
+          <Animated.View style={{ opacity: fadeAnim }}>
+            {isCorrect === true && (
+              <Animated.View
+                style={[styles.resultCard, styles.successCard, {
+                  transform: [{
+                    scale: bounceAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [0.8, 1],
+                    }),
+                  }],
+                }]}
+              >
+                <Text style={styles.resultEmoji}>🎉</Text>
+                <Text style={styles.resultTitle}>Perfect!</Text>
+                <Text style={styles.resultScore}>+{score} points</Text>
+                {attempts > 1 && (
+                  <Text style={styles.resultDetail}>Solved in {attempts} attempt{attempts > 1 ? 's' : ''}!</Text>
+                )}
+              </Animated.View>
+            )}
+
+            {isCorrect === false && (
+              <View style={[styles.resultCard, styles.errorCard]}>
+                <Text style={styles.resultEmoji}>🤔</Text>
+                <Text style={styles.resultTitle}>Not quite right</Text>
+                <Text style={styles.resultDetail}>Try rearranging the words!</Text>
+              </View>
+            )}
+          </Animated.View>
+        </ScrollView>
+      )}
+
+      {renderConfetti()}
     </SafeAreaView>
   );
 }
@@ -436,15 +566,15 @@ const styles = StyleSheet.create({
     paddingBottom: 40,
   },
   instructionCard: {
-    backgroundColor: '#E8F5E9',
     borderRadius: 12,
     padding: 12,
     marginBottom: 16,
   },
   instructionText: {
     fontSize: 14,
-    color: '#2E7D32',
+    color: '#333',
     textAlign: 'center',
+    fontWeight: '500',
   },
   placedArea: {
     marginBottom: 16,
@@ -466,7 +596,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 2,
     borderColor: '#E8E8E8',
-    borderStyle: 'dashed',
   },
   correctBorder: {
     borderColor: '#34C759',
@@ -490,6 +619,48 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontStyle: 'italic',
   },
+  insightCard: {
+    backgroundColor: '#FFF3E0',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
+    borderLeftWidth: 4,
+    borderLeftColor: '#FF9800',
+  },
+  insightTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#E65100',
+    marginBottom: 6,
+  },
+  insightText: {
+    fontSize: 14,
+    color: '#795548',
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  insightTags: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  insightTag: {
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    marginRight: 6,
+    marginBottom: 4,
+  },
+  insightTagText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#E65100',
+  },
+  insightWords: {
+    fontSize: 13,
+    color: '#8D6E63',
+    fontStyle: 'italic',
+  },
   hintCard: {
     backgroundColor: '#FFF8E1',
     borderRadius: 12,
@@ -497,6 +668,12 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     borderLeftWidth: 4,
     borderLeftColor: '#FFC107',
+  },
+  hintLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#F57F17',
+    marginBottom: 4,
   },
   hintText: {
     fontSize: 14,

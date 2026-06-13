@@ -5,7 +5,13 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
-import { getApiKey, saveApiKey, getStats, getSettings, saveSetting, clearAllData } from '../services/storageService';
+import {
+  getApiKey, saveApiKey, getStats, getSettings, saveSetting,
+  clearAllData, getWeaknessProfile, getWeaknessCategories,
+  getProblemWords, getMistakeRecords, saveAIAnalysis,
+  clearMistakeRecords
+} from '../services/storageService';
+import { compileWeaknessProfile } from '../services/aiService';
 
 const DIFFICULTIES = [
   { id: 'beginner', label: 'Beginner', emoji: '🌱', color: '#34C759', description: 'Simple sentences (5-8 words)' },
@@ -23,13 +29,74 @@ function StatCard({ label, value, emoji }) {
   );
 }
 
+function AccuracyBar({ label, accuracy, total }) {
+  const pct = Math.round(accuracy * 100);
+  const barColor = pct >= 80 ? '#34C759' : pct >= 50 ? '#FF9500' : '#FF3B30';
+  return (
+    <View style={styles.accBarRow}>
+      <View style={styles.accBarLabel}>
+        <Text style={styles.accBarText}>{label}</Text>
+        <Text style={styles.accBarPct}>{pct}%</Text>
+      </View>
+      <View style={styles.accBarBg}>
+        <View style={[styles.accBarFill, { width: `${pct}%`, backgroundColor: barColor }]} />
+      </View>
+      <Text style={styles.accBarTotal}>{total}x</Text>
+    </View>
+  );
+}
+
+function WeaknessAnalysisCard({ analysis }) {
+  if (!analysis || !analysis.categories || analysis.categories.length === 0) return null;
+
+  const labelMap = {
+    wordOrder: '📋 Word Order',
+    subjectVerbAgreement: '🔗 Subject-Verb',
+    articleUsage: '📌 Article',
+    prepositionUsage: '📍 Preposition',
+    tenseUsage: '⏰ Tense',
+    conjunctionUsage: '🔀 Conjunction',
+    adverbPlacement: '⚡ Adverb',
+    adjectiveOrder: '🎨 Adjective',
+    negation: '🚫 Negation',
+    pronounUsage: '👤 Pronoun',
+  };
+
+  return (
+    <View style={styles.weaknessAnalysisCard}>
+      <Text style={styles.weaknessAnalysisTitle}>🧠 AI Analysis</Text>
+      {analysis.recommendation && (
+        <Text style={styles.weaknessRecommendation}>{analysis.recommendation}</Text>
+      )}
+      <View style={styles.weaknessAnalysisTags}>
+        {analysis.categories.slice(0, 4).map(cat => (
+          <View key={cat} style={styles.weaknessTag}>
+            <Text style={styles.weaknessTagText}>{labelMap[cat] || cat}</Text>
+          </View>
+        ))}
+      </View>
+      {analysis.problemWords && analysis.problemWords.length > 0 && (
+        <Text style={styles.weaknessWords}>
+          Focus on: {analysis.problemWords.slice(0, 4).map(w => `"${w}"`).join(', ')}
+        </Text>
+      )}
+    </View>
+  );
+}
+
 export default function HomeScreen({ navigation }) {
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [stats, setStats] = useState(null);
   const [selectedDifficulty, setSelectedDifficulty] = useState('beginner');
   const [showSettings, setShowSettings] = useState(false);
+  const [weaknessCategories, setWeaknessCategories] = useState([]);
+  const [problemWords, setProblemWords] = useState([]);
+  const [weaknessProfile, setWeaknessProfile] = useState(null);
+  const [mistakeCount, setMistakeCount] = useState(0);
+  const [analyzing, setAnalyzing] = useState(false);
   const fadeAnim = useState(new Animated.Value(0))[0];
+  const weaknessAnim = useState(new Animated.Value(0))[0];
 
   const loadData = useCallback(async () => {
     const key = await getApiKey();
@@ -38,6 +105,16 @@ export default function HomeScreen({ navigation }) {
     setStats(s);
     const settings = await getSettings();
     setSelectedDifficulty(settings.difficulty || 'beginner');
+
+    // Load weakness data
+    const cats = await getWeaknessCategories(4);
+    setWeaknessCategories(cats);
+    const words = await getProblemWords(5);
+    setProblemWords(words);
+    const profile = await getWeaknessProfile();
+    setWeaknessProfile(profile);
+    const mistakes = await getMistakeRecords(1);
+    setMistakeCount(profile.totalMistakes || 0);
   }, []);
 
   useEffect(() => {
@@ -47,7 +124,13 @@ export default function HomeScreen({ navigation }) {
       duration: 600,
       useNativeDriver: true,
     }).start();
-  }, [loadData, fadeAnim]);
+    Animated.timing(weaknessAnim, {
+      toValue: 1,
+      duration: 800,
+      delay: 300,
+      useNativeDriver: true,
+    }).start();
+  }, [loadData, fadeAnim, weaknessAnim]);
 
   useEffect(() => {
     const unsubscribe = navigation.addListener('focus', loadData);
@@ -71,7 +154,7 @@ export default function HomeScreen({ navigation }) {
   const handleClearData = () => {
     Alert.alert(
       'Clear All Data',
-      'This will remove your API key and progress. Are you sure?',
+      'This will remove your API key, progress, and weakness profile. Are you sure?',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -84,6 +167,32 @@ export default function HomeScreen({ navigation }) {
         },
       ]
     );
+  };
+
+  const handleAnalyzeWeakness = async () => {
+    const key = await getApiKey();
+    if (!key) {
+      Alert.alert('API Key Needed', 'Add an OpenAI API key in Settings to enable AI weakness analysis.');
+      return;
+    }
+
+    const mistakes = await getMistakeRecords(20);
+    if (mistakes.length < 3) {
+      Alert.alert('Not Enough Data', 'Play at least 3 games and make some mistakes first!');
+      return;
+    }
+
+    setAnalyzing(true);
+    const analysis = await compileWeaknessProfile(mistakes, key);
+    if (analysis) {
+      await saveAIAnalysis(JSON.stringify(analysis));
+      // Update the weakness profile with the analysis
+      if (analysis.recommendation) {
+        Alert.alert('📊 Analysis Complete', analysis.recommendation);
+      }
+    }
+    setAnalyzing(false);
+    loadData();
   };
 
   const getGradientColors = () => {
@@ -100,11 +209,13 @@ export default function HomeScreen({ navigation }) {
     <SafeAreaView style={[styles.container, { backgroundColor: bgColor1 }]}>
       <StatusBar style="dark" />
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        {/* Header */}
         <Animated.View style={[styles.header, { opacity: fadeAnim }]}>
           <Text style={styles.title}>🧩 Word Arrange</Text>
           <Text style={styles.subtitle}>Practice English by arranging words!</Text>
         </Animated.View>
 
+        {/* Stats */}
         {stats && (
           <Animated.View style={[styles.statsRow, { opacity: fadeAnim }]}>
             <StatCard emoji="🎮" label="Played" value={stats.gamesPlayed} />
@@ -114,6 +225,102 @@ export default function HomeScreen({ navigation }) {
           </Animated.View>
         )}
 
+        {/* Weakness Dashboard */}
+        {mistakeCount > 0 && (
+          <Animated.View
+            style={[styles.weaknessSection, {
+              opacity: weaknessAnim,
+              transform: [{
+                translateY: weaknessAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [20, 0],
+                }),
+              }],
+            }]}
+          >
+            <View style={styles.weaknessHeader}>
+              <Text style={styles.sectionTitle}>🎯 Your Weak Areas</Text>
+              <Text style={styles.weaknessBadge}>{mistakeCount} mistakes</Text>
+            </View>
+
+            {/* AI Analysis (if available) */}
+            {weaknessProfile?.aiAnalysis && (() => {
+              try {
+                const analysis = typeof weaknessProfile.aiAnalysis === 'string'
+                  ? JSON.parse(weaknessProfile.aiAnalysis)
+                  : weaknessProfile.aiAnalysis;
+                return <WeaknessAnalysisCard analysis={analysis} />;
+              } catch {
+                return null;
+              }
+            })()}
+
+            {/* Weak Categories */}
+            {weaknessCategories.length > 0 && (
+              <View style={styles.weaknessCard}>
+                <Text style={styles.weaknessCardTitle}>📉 Grammar Patterns</Text>
+                {weaknessCategories.map(cat => (
+                  <AccuracyBar
+                    key={cat.key}
+                    label={cat.label}
+                    accuracy={cat.accuracy}
+                    total={cat.total}
+                  />
+                ))}
+              </View>
+            )}
+
+            {/* Problem Words */}
+            {problemWords.length > 0 && (
+              <View style={styles.weaknessCard}>
+                <Text style={styles.weaknessCardTitle}>🔤 Tricky Words</Text>
+                <View style={styles.problemWordsRow}>
+                  {problemWords.map(pw => (
+                    <View
+                      key={pw.word}
+                      style={[
+                        styles.problemWordTag,
+                        {
+                          backgroundColor:
+                            pw.accuracy < 0.5 ? '#FFEBEE' :
+                            pw.accuracy < 0.75 ? '#FFF8E1' : '#E8F5E9',
+                        },
+                      ]}
+                    >
+                      <Text style={styles.problemWordText}>"{pw.word}"</Text>
+                      <Text style={styles.problemWordPct}>{Math.round(pw.accuracy * 100)}%</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            )}
+
+            {/* Analyze Button */}
+            {mistakeCount >= 3 && (
+              <TouchableOpacity
+                style={styles.analyzeBtn}
+                onPress={handleAnalyzeWeakness}
+                disabled={analyzing}
+              >
+                <Text style={styles.analyzeBtnText}>
+                  {analyzing ? '🔍 Analyzing...' : '🧠 AI Deep Analysis'}
+                </Text>
+              </TouchableOpacity>
+            )}
+          </Animated.View>
+        )}
+
+        {/* Start practicing prompt when no mistakes */}
+        {mistakeCount === 0 && (
+          <Animated.View style={[styles.emptyWeakness, { opacity: fadeAnim }]}>
+            <Text style={styles.emptyWeaknessEmoji}>🧘</Text>
+            <Text style={styles.emptyWeaknessText}>
+              Play some games first! AI will analyze your mistakes and show weak areas here.
+            </Text>
+          </Animated.View>
+        )}
+
+        {/* Difficulty Selection */}
         <Animated.View style={[styles.section, { opacity: fadeAnim }]}>
           <Text style={styles.sectionTitle}>📖 Select Difficulty</Text>
           <View style={styles.difficultyRow}>
@@ -135,26 +342,33 @@ export default function HomeScreen({ navigation }) {
           </View>
         </Animated.View>
 
-        <TouchableOpacity
-          style={[styles.startButton, { backgroundColor: DIFFICULTIES.find(d => d.id === selectedDifficulty)?.color || '#4A90D9' }]}
-          onPress={handleStartGame}
-        >
-          <Text style={styles.startButtonText}>▶ Start Practice</Text>
-        </TouchableOpacity>
+        {/* Start Button */}
+        <Animated.View style={{ opacity: fadeAnim }}>
+          <TouchableOpacity
+            style={[styles.startButton, { backgroundColor: DIFFICULTIES.find(d => d.id === selectedDifficulty)?.color || '#4A90D9' }]}
+            onPress={handleStartGame}
+          >
+            <Text style={styles.startButtonText}>▶ Start Practice</Text>
+          </TouchableOpacity>
+        </Animated.View>
 
-        <TouchableOpacity
-          style={styles.settingsToggle}
-          onPress={() => setShowSettings(!showSettings)}
-        >
-          <Text style={styles.settingsToggleText}>
-            {showSettings ? '▼ Hide Settings' : '▶ API Settings'}
-          </Text>
-        </TouchableOpacity>
+        {/* Settings Toggle */}
+        <Animated.View style={{ opacity: fadeAnim }}>
+          <TouchableOpacity
+            style={styles.settingsToggle}
+            onPress={() => setShowSettings(!showSettings)}
+          >
+            <Text style={styles.settingsToggleText}>
+              {showSettings ? '▲ Hide Settings' : '▼ Settings'}
+            </Text>
+          </TouchableOpacity>
+        </Animated.View>
 
+        {/* Settings Panel */}
         {showSettings && (
           <Animated.View style={styles.settingsPanel}>
             <Text style={styles.settingsTitle}>⚙️ Settings</Text>
-            
+
             <Text style={styles.inputLabel}>OpenAI API Key (optional)</Text>
             <Text style={styles.inputHint}>
               Without a key, built-in sentences are used. Get a key at platform.openai.com
@@ -180,6 +394,31 @@ export default function HomeScreen({ navigation }) {
             <TouchableOpacity style={styles.saveBtn} onPress={handleSaveApiKey}>
               <Text style={styles.saveBtnText}>Save API Key</Text>
             </TouchableOpacity>
+
+            {mistakeCount > 0 && (
+              <TouchableOpacity
+                style={styles.clearWeaknessBtn}
+                onPress={() => {
+                  Alert.alert(
+                    'Clear Weakness Data',
+                    'Remove all saved weakness analysis and mistakes?',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Clear',
+                        style: 'destructive',
+                        onPress: async () => {
+                          await clearMistakeRecords();
+                          loadData();
+                        },
+                      },
+                    ]
+                  );
+                }}
+              >
+                <Text style={styles.clearWeaknessBtnText}>🗑️ Clear Weakness Data</Text>
+              </TouchableOpacity>
+            )}
 
             <TouchableOpacity style={styles.clearBtn} onPress={handleClearData}>
               <Text style={styles.clearBtnText}>🗑️ Clear All Data</Text>
@@ -217,7 +456,7 @@ const styles = StyleSheet.create({
   statsRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 24,
+    marginBottom: 16,
   },
   statCard: {
     backgroundColor: 'white',
@@ -246,8 +485,184 @@ const styles = StyleSheet.create({
     color: '#999',
     marginTop: 2,
   },
-  section: {
+  // Weakness Section
+  weaknessSection: {
     marginBottom: 20,
+  },
+  weaknessHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  weaknessBadge: {
+    backgroundColor: '#FFE0B2',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#E65100',
+    overflow: 'hidden',
+  },
+  weaknessCard: {
+    backgroundColor: 'white',
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 10,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 3,
+  },
+  weaknessCardTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#1A1A2E',
+    marginBottom: 10,
+  },
+  // Accuracy Bar
+  accBarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  accBarLabel: {
+    width: 120,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  accBarText: {
+    fontSize: 12,
+    color: '#555',
+    fontWeight: '500',
+  },
+  accBarPct: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#333',
+  },
+  accBarBg: {
+    flex: 1,
+    height: 8,
+    backgroundColor: '#F0F0F0',
+    borderRadius: 4,
+    marginHorizontal: 8,
+    overflow: 'hidden',
+  },
+  accBarFill: {
+    height: '100%',
+    borderRadius: 4,
+  },
+  accBarTotal: {
+    fontSize: 11,
+    color: '#999',
+    width: 24,
+    textAlign: 'right',
+  },
+  // Problem Words
+  problemWordsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  problemWordTag: {
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginRight: 8,
+    marginBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  problemWordText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#333',
+  },
+  problemWordPct: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#666',
+    marginLeft: 6,
+  },
+  // AI Analysis
+  weaknessAnalysisCard: {
+    backgroundColor: '#F3E5F5',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderLeftWidth: 4,
+    borderLeftColor: '#9C27B0',
+  },
+  weaknessAnalysisTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#6A1B9A',
+    marginBottom: 6,
+  },
+  weaknessRecommendation: {
+    fontSize: 14,
+    color: '#4A148C',
+    marginBottom: 8,
+    lineHeight: 20,
+    fontWeight: '500',
+  },
+  weaknessAnalysisTags: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  weaknessTag: {
+    backgroundColor: '#E1BEE7',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    marginRight: 6,
+    marginBottom: 4,
+  },
+  weaknessTagText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6A1B9A',
+  },
+  weaknessWords: {
+    fontSize: 13,
+    color: '#8D6E63',
+    fontStyle: 'italic',
+  },
+  // Analyze button
+  analyzeBtn: {
+    backgroundColor: '#7B1FA2',
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    elevation: 2,
+  },
+  analyzeBtnText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  // Empty state
+  emptyWeakness: {
+    alignItems: 'center',
+    paddingVertical: 20,
+    marginBottom: 10,
+  },
+  emptyWeaknessEmoji: {
+    fontSize: 32,
+    marginBottom: 8,
+  },
+  emptyWeaknessText: {
+    fontSize: 14,
+    color: '#999',
+    textAlign: 'center',
+    paddingHorizontal: 20,
+  },
+  // Difficulty
+  section: {
+    marginBottom: 16,
   },
   sectionTitle: {
     fontSize: 18,
@@ -371,10 +786,24 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     fontSize: 14,
   },
+  clearWeaknessBtn: {
+    alignItems: 'center',
+    marginTop: 12,
+    paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F0F0F0',
+  },
+  clearWeaknessBtnText: {
+    color: '#FF9800',
+    fontSize: 13,
+    fontWeight: '600',
+  },
   clearBtn: {
     alignItems: 'center',
-    marginTop: 16,
+    marginTop: 12,
     paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F0F0F0',
   },
   clearBtnText: {
     color: '#FF3B30',
