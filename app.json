@@ -36,9 +36,6 @@
       "eas": {
         "projectId": "word-arrange-ai"
       }
-    },
-    "plugins": [
-      "react-native-reanimated"
-    ]
+    }
   }
 }
