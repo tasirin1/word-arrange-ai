@@ -24,7 +24,7 @@ jobs:
   build:
     name: Build APK
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +33,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'npm'
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -45,15 +44,16 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Prebuild native Android project
-        run: npx expo prebuild --platform android --clean
+        run: npx expo prebuild --platform android --clean --no-install
 
       - name: Build APK
         run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'release' }}"
           cd android
-          if [ "${{ github.event.inputs.build_type || 'release' }}" = "debug" ]; then
+          if [ "$BUILD_TYPE" = "debug" ]; then
             ./gradlew assembleDebug
           else
             ./gradlew assembleRelease
@@ -61,20 +61,17 @@ jobs:
 
       - name: Rename APK
         run: |
-          VERSION=$(node -p "require('./package.json').version")
           BUILD_TYPE="${{ github.event.inputs.build_type || 'release' }}"
-          for apk in android/app/build/outputs/apk/${BUILD_TYPE}/*.apk; do
-            if [ -f "$apk" ]; then
-              dir=$(dirname "$apk")
-              ext="${apk##*.}"
-              mv "$apk" "${dir}/WordArrangeAI-v${VERSION}-${BUILD_TYPE}.${ext}"
-            fi
+          VERSION=$(node -p "require('./package.json').version")
+          find android/app/build/outputs/apk/${BUILD_TYPE} -name '*.apk' | while read apk; do
+            dir=$(dirname "$apk")
+            mv "$apk" "${dir}/WordArrangeAI-v${VERSION}-${BUILD_TYPE}.apk"
           done
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WordArrangeAI-APK
+          name: WordArrangeAI-APK-${{ github.event.inputs.build_type || 'release' }}
           path: android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 60
