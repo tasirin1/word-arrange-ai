@@ -43,8 +43,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies with Expo
+        run: |
+          npm install
+          npx expo install --fix
 
       - name: Prebuild native Android project
         run: npx expo prebuild --platform android --clean --no-install
